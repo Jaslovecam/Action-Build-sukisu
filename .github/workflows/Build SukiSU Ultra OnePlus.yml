@@ -43,8 +43,15 @@ jobs:
       ANYKERNEL: AnyKernel3
       TOOLCHAIN: clang
       KSU_BRANCH: susfs-stable
+      # 新增：设置超时时间变量
+      BUILD_TIMEOUT: 180  # 3小时
 
     steps:
+      - name: 检查工作流超时
+        run: |
+          echo "构建超时设置为 ${{ env.BUILD_TIMEOUT }} 分钟"
+          echo "如果构建超时，请检查编译配置或增加超时时间"
+
       - name: 最大化构建空间
         uses: easimon/maximize-build-space@master
         with:
@@ -64,107 +71,166 @@ jobs:
             bc dwarves libelf-dev zstd \
             clang llvm lld zip unzip ccache \
             libncurses5-dev libncursesw5-dev
+          
+          # 验证关键工具是否安装成功
+          for tool in clang git curl ccache make; do
+            if ! command -v $tool &> /dev/null; then
+              echo "错误：$tool 未安装成功"
+              exit 1
+            fi
+          done
+          
+          # 显示关键工具版本
+          clang --version | head -n1
+          git --version
 
       - name: 配置CCache
         uses: actions/cache@v3
         with:
           path: ~/.ccache
-          key: ${{ runner.os }}-ccache-${{ github.sha }}
+          key: ${{ runner.os }}-ccache-${{ github.event.inputs.BRANCH }}-${{ github.sha }}
           restore-keys: |
+            ${{ runner.os }}-ccache-${{ github.event.inputs.BRANCH }}-
             ${{ runner.os }}-ccache-
 
       - name: 初始化CCache
         run: |
           ccache -M 20G
           ccache -s
+          # 确保缓存目录权限正确
+          chmod -R 777 ~/.ccache
 
       - name: 下载内核源码
+        id: source_download
         run: |
           mkdir -p ${{ env.WORKSPACE }}
           cd ${{ env.WORKSPACE }}
           
-          # 克隆内核源码
-          git clone https://github.com/yaap/kernel_oneplus_sm8650.git -b ${{ github.event.inputs.BRANCH }} ${{ env.KERNEL_DIR }}
+          # 克隆内核源码，增加超时和深度限制
+          if ! git clone --depth 1 --single-branch \
+            -b ${{ github.event.inputs.BRANCH }} \
+            https://github.com/yaap/kernel_oneplus_sm8650.git \
+            ${{ env.KERNEL_DIR }}; then
+            echo "内核源码克隆失败，尝试无深度限制克隆"
+            git clone -b ${{ github.event.inputs.BRANCH }} \
+              https://github.com/yaap/kernel_oneplus_sm8650.git \
+              ${{ env.KERNEL_DIR }} || exit 1
+          fi
           
           # 进入内核目录
           cd ${{ env.KERNEL_DIR }}
           
           # 记录源码版本
-          git rev-parse HEAD > source_commit.txt
-          echo "内核源码版本: $(cat source_commit.txt | cut -c1-8)"
+          COMMIT_HASH=$(git rev-parse HEAD)
+          echo "内核源码版本: ${COMMIT_HASH:0:8}"
+          echo "commit_hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
 
       - name: 集成SukiSU
+        id: integrate_ksu
         run: |
-          cd ${{ env.WORKSPACE }}/${{ env.KERNEL_DIR }}
+          cd ${{ env.WORKSPACE }}/${{ env.KERNEL_DIR }} || exit 1
           
-          # 下载并安装SukiSU
-          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/KernelSU/main/kernel/setup.sh" | bash -s ${{ env.KSU_BRANCH }}
+          # 下载并安装SukiSU，增加超时控制
+          if ! curl -LSs --max-time 300 \
+            "https://raw.githubusercontent.com/ShirkNeko/KernelSU/main/kernel/setup.sh" | \
+            bash -s ${{ env.KSU_BRANCH }}; then
+            echo "SukiSU集成失败！"
+            exit 1
+          fi
           
           # 获取SukiSU版本号
-          cd KernelSU
+          cd KernelSU || exit 1
           KSU_VERSION=$(expr $(git rev-list --count HEAD) + 12505)
           echo "KSU_VERSION=$KSU_VERSION" >> $GITHUB_ENV
+          echo "ksu_version=$KSU_VERSION" >> $GITHUB_OUTPUT
           echo "SukiSU版本: $KSU_VERSION"
           cd ..
 
       - name: 应用SUSFS补丁
         if: ${{ github.event.inputs.SUSFS_ENABLED == 'true' }}
         run: |
-          cd ${{ env.WORKSPACE }}
+          cd ${{ env.WORKSPACE }} || exit 1
           
           # 克隆SUSFS补丁仓库
-          git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}
+          git clone --depth 1 \
+            https://gitlab.com/simonpunk/susfs4ksu.git \
+            -b gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }} || exit 1
           
           # 进入内核目录
-          cd ${{ env.KERNEL_DIR }}
+          cd ${{ env.KERNEL_DIR }} || exit 1
+          
+          # 检查补丁文件是否存在
+          PATCH_FILE="../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch"
+          if [ ! -f "$PATCH_FILE" ]; then
+            echo "错误：SUSFS补丁文件 $PATCH_FILE 不存在！"
+            exit 1
+          fi
           
           # 复制补丁文件
-          cp ../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch ./
-          cp ../susfs4ksu/kernel_patches/fs/* ./fs/
-          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/
+          cp "$PATCH_FILE" ./ || exit 1
+          cp ../susfs4ksu/kernel_patches/fs/* ./fs/ || exit 1
+          cp ../susfs4ksu/kernel_patches/include/linux/* ./include/linux/ || exit 1
           
-          # 应用补丁
+          # 应用补丁，保存输出日志
           echo "应用SUSFS补丁..."
-          if ! patch -p1 < 50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch; then
-            echo "SUSFS补丁应用失败!"
+          if ! patch -p1 < $(basename "$PATCH_FILE") > patch_susfs.log 2>&1; then
+            echo "SUSFS补丁应用失败！日志内容："
+            cat patch_susfs.log
             exit 1
           fi
 
       - name: 应用隐藏补丁
         if: ${{ github.event.inputs.HIDE_PATCHES == 'true' }}
         run: |
-          cd ${{ env.WORKSPACE }}
+          cd ${{ env.WORKSPACE }} || exit 1
           
           # 克隆补丁仓库
-          git clone https://github.com/cabagekiller/kernel_patches.git
+          git clone --depth 1 https://github.com/cabagekiller/kernel_patches.git || exit 1
           
           # 进入内核目录
-          cd ${{ env.KERNEL_DIR }}
+          cd ${{ env.KERNEL_DIR }} || exit 1
+          
+          # 检查补丁文件
+          PATCH_FILE="../kernel_patches/69_hide_stuff.patch"
+          if [ ! -f "$PATCH_FILE" ]; then
+            echo "错误：隐藏补丁文件 $PATCH_FILE 不存在！"
+            exit 1
+          fi
           
           # 应用隐藏补丁
           echo "应用隐藏补丁..."
-          cp ../kernel_patches/69_hide_stuff.patch ./
-          if ! patch -p1 -F 3 < 69_hide_stuff.patch; then
-            echo "隐藏补丁应用失败!"
+          cp "$PATCH_FILE" ./ || exit 1
+          if ! patch -p1 -F 3 < $(basename "$PATCH_FILE") > patch_hide.log 2>&1; then
+            echo "隐藏补丁应用失败！日志内容："
+            cat patch_hide.log
             exit 1
           fi
 
       - name: 配置内核选项
         run: |
-          cd ${{ env.WORKSPACE }}/${{ env.KERNEL_DIR }}
+          cd ${{ env.WORKSPACE }}/${{ env.KERNEL_DIR }} || exit 1
           
           # 创建输出目录
-          mkdir -p ${{ env.OUT_DIR }}
+          mkdir -p ${{ env.OUT_DIR }} || exit 1
           
-          # 加载基础配置
-          make ARCH=arm64 O=${{ env.OUT_DIR }} \
+          # 加载基础配置，保存配置日志
+          echo "加载内核配置..."
+          if ! make ARCH=arm64 O=${{ env.OUT_DIR }} \
             gki_defconfig \
             vendor/${{ github.event.inputs.DEVICE_CODENAME }}_GKI.config \
             vendor/oplus/${{ github.event.inputs.DEVICE_CODENAME }}_GKI.config \
-            vendor/oplus/waffle.config
+            vendor/oplus/waffle.config > defconfig.log 2>&1; then
+            echo "配置加载失败！日志内容："
+            cat defconfig.log
+            exit 1
+          fi
           
           # 配置SukiSU相关选项
           DEFCONFIG=${{ env.OUT_DIR }}/.config
+          if [ ! -f "$DEFCONFIG" ]; then
+            echo "错误：配置文件 $DEFCONFIG 未生成！"
+            exit 1
+          fi
           
           # 添加SukiSU配置
           echo "CONFIG_KSU=y" >> $DEFCONFIG
@@ -185,17 +251,21 @@ jobs:
           echo "CONFIG_TMPFS_XATTR=y" >> $DEFCONFIG
           
           # 移除defconfig检查
-          sed -i 's/check_defconfig//' ./build.config.gki
+          sed -i 's/check_defconfig//' ./build.config.gki || exit 1
           
           # 修改内核名称
-          sed -i "s/EXTRAVERSION =.*/EXTRAVERSION = ${{ github.event.inputs.KERNEL_SUFFIX }}/" Makefile
+          sed -i "s/EXTRAVERSION =.*/EXTRAVERSION = ${{ github.event.inputs.KERNEL_SUFFIX }}/" Makefile || exit 1
           if [ -f ./scripts/setlocalversion ]; then
-            sed -i 's/-dirty//' ./scripts/setlocalversion
+            sed -i 's/-dirty//' ./scripts/setlocalversion || exit 1
           fi
+          
+          # 保存最终配置用于调试
+          cp $DEFCONFIG ../../final_config.txt
 
       - name: 编译内核
+        timeout-minutes: ${{ env.BUILD_TIMEOUT }}
         run: |
-          cd ${{ env.WORKSPACE }}/${{ env.KERNEL_DIR }}
+          cd ${{ env.WORKSPACE }}/${{ env.KERNEL_DIR }} || exit 1
           
           # 配置编译参数
           export ARCH=arm64
@@ -204,18 +274,38 @@ jobs:
           export LLVM_IAS=1
           export PATH="/usr/lib/ccache:$PATH"
           
-          # 编译内核
-          echo "开始编译内核..."
-          make O=${{ env.OUT_DIR }} -j$(nproc --all)
+          # 显示编译环境信息
+          echo "编译环境信息："
+          echo "ARCH: $ARCH"
+          echo "CC: $CC"
+          echo "CPU核心数: $(nproc --all)"
           
-          # 编译模块
-          make O=${{ env.OUT_DIR }} modules_install INSTALL_MOD_PATH=./modules
-          
-          # 检查编译结果
-          if [ ! -f "${{ env.OUT_DIR }}/arch/arm64/boot/Image" ]; then
-            echo "内核编译失败，未找到Image文件!"
+          # 编译内核，限制并行数避免OOM
+          JOBS=$(( $(nproc --all) * 3 / 4 ))
+          echo "使用 $JOBS 个并行任务编译..."
+          if ! make O=${{ env.OUT_DIR }} -j$JOBS > build.log 2>&1; then
+            echo "内核编译失败！最后100行日志："
+            tail -n 100 build.log
             exit 1
           fi
+          
+          # 编译模块
+          if ! make O=${{ env.OUT_DIR }} modules_install INSTALL_MOD_PATH=./modules > modules.log 2>&1; then
+            echo "模块编译失败！最后100行日志："
+            tail -n 100 modules.log
+            exit 1
+          fi
+          
+          # 检查编译结果
+          IMAGE_FILE="${{ env.OUT_DIR }}/arch/arm64/boot/Image"
+          if [ ! -f "$IMAGE_FILE" ]; then
+            echo "内核编译失败，未找到Image文件: $IMAGE_FILE"
+            exit 1
+          fi
+          
+          # 显示编译后的文件大小
+          echo "内核镜像大小："
+          ls -lh "$IMAGE_FILE"
           
           # 显示CCache统计
           ccache -s
@@ -227,23 +317,33 @@ jobs:
           echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
           
           # 克隆AnyKernel3
-          cd ${{ env.WORKSPACE }}
-          git clone https://github.com/cabagekiller/AnyKernel3.git -b gki-2.0 ${{ env.ANYKERNEL }}
+          cd ${{ env.WORKSPACE }} || exit 1
+          git clone --depth 1 https://github.com/cabagekiller/AnyKernel3.git -b gki-2.0 ${{ env.ANYKERNEL }} || exit 1
           
           # 复制内核镜像
-          cp ${{ env.KERNEL_DIR }}/${{ env.OUT_DIR }}/arch/arm64/boot/Image ${{ env.ANYKERNEL }}/
+          IMAGE_SOURCE="${{ env.KERNEL_DIR }}/${{ env.OUT_DIR }}/arch/arm64/boot/Image"
+          if [ ! -f "$IMAGE_SOURCE" ]; then
+            echo "错误：内核镜像 $IMAGE_SOURCE 不存在！"
+            exit 1
+          fi
+          cp "$IMAGE_SOURCE" ${{ env.ANYKERNEL }}/ || exit 1
           
           # 复制模块
-          mkdir -p ${{ env.ANYKERNEL }}/modules
-          cp -r ${{ env.KERNEL_DIR }}/modules/lib/modules/* ${{ env.ANYKERNEL }}/modules/
+          mkdir -p ${{ env.ANYKERNEL }}/modules || exit 1
+          MODULES_SOURCE="${{ env.KERNEL_DIR }}/modules/lib/modules"
+          if [ -d "$MODULES_SOURCE" ]; then
+            cp -r "$MODULES_SOURCE"/* ${{ env.ANYKERNEL }}/modules/ || exit 1
+          else
+            echo "警告：模块目录 $MODULES_SOURCE 不存在，可能未生成模块"
+          fi
           
           # 创建压缩包名称
           ZIP_NAME="${{ github.event.inputs.DEVICE_CODENAME }}-kernel-${{ github.event.inputs.KERNEL_VERSION }}-${{ env.KSU_VERSION }}-${TIMESTAMP}.zip"
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
           
           # 打包
-          cd ${{ env.ANYKERNEL }}
-          zip -r9 ../$ZIP_NAME * -x ".git*" "LICENSE" "README.md"
+          cd ${{ env.ANYKERNEL }} || exit 1
+          zip -r9 ../$ZIP_NAME * -x ".git*" "LICENSE" "README.md" > zip.log 2>&1 || exit 1
           
           # 验证打包结果
           if [ ! -f "../$ZIP_NAME" ]; then
@@ -251,31 +351,115 @@ jobs:
             exit 1
           fi
           
+          # 显示压缩包信息
+          echo "生成的压缩包："
+          ls -lh ../$ZIP_NAME
+          unzip -l ../$ZIP_NAME | head -n 10
+          
+          # 计算哈希值
+          sha256sum ../$ZIP_NAME > ../$ZIP_NAME.sha256
+          
           # 移动到工作区根目录
-          mv ../$ZIP_NAME ../../
+          mv ../$ZIP_NAME ../../ || exit 1
+          mv ../$ZIP_NAME.sha256 ../../ || exit 1
+
+      - name: 验证发布资产
+        if: success()
+        run: |
+          # 检查发布文件
+          if [ ! -f "${{ env.ZIP_NAME }}" ]; then
+            echo "错误：发布文件 ${{ env.ZIP_NAME }} 不存在！"
+            exit 1
+          fi
+          
+          # 检查文件大小
+          FILE_SIZE=$(stat -c%s "${{ env.ZIP_NAME }}")
+          if [ $FILE_SIZE -lt 10485760 ]; then  # 10MB
+            echo "警告：发布文件可能不完整（小于10MB）"
+          fi
+          
+          echo "发布资产验证通过"
 
       - name: 创建发布
         uses: softprops/action-gh-release@v1
         with:
-          files: ${{ env.ZIP_NAME }}
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.ZIP_NAME }}.sha256
           tag_name: suki-kernel-${{ github.event.inputs.DEVICE_CODENAME }}-${{ env.TIMESTAMP }}
           name: SukiSU Kernel ${{ github.event.inputs.KERNEL_VERSION }} for ${{ github.event.inputs.DEVICE_CODENAME }}
           body: |
             # SukiSU 内核发布
             
+            ## 基本信息
             - 设备: ${{ github.event.inputs.DEVICE_CODENAME }}
             - 内核版本: ${{ github.event.inputs.KERNEL_VERSION }}
             - 安卓版本: ${{ github.event.inputs.ANDROID_VERSION }}
             - SukiSU版本: ${{ env.KSU_VERSION }}
             - 构建时间: ${{ env.TIMESTAMP }}
             - 源码分支: ${{ github.event.inputs.BRANCH }}
+            - 源码版本: ${{ steps.source_download.outputs.commit_hash:0:8 }}
             
-            ## 功能
-            - 集成SukiSU
-            - ${{ github.event.inputs.SUSFS_ENABLED == 'true' && '已启用SUSFS' || '未启用SUSFS' }}
-            - ${{ github.event.inputs.HIDE_PATCHES == 'true' && '已应用隐藏补丁' || '未应用隐藏补丁' }}
+            ## 功能特性
+            - 集成SukiSU根权限管理
+            - ${{ github.event.inputs.SUSFS_ENABLED == 'true' && '✅ 已启用SUSFS文件系统增强' || '❌ 未启用SUSFS' }}
+            - ${{ github.event.inputs.HIDE_PATCHES == 'true' && '✅ 已应用隐藏补丁' || '❌ 未应用隐藏补丁' }}
+            
+            ## 验证信息
+            SHA256: `$(cat ${{ env.ZIP_NAME }}.sha256 | awk '{print $1}')`
+            
+            ## 刷入说明
+            1. 确保设备已解锁Bootloader并安装最新Recovery
+            2. 下载发布文件并验证哈希值
+            3. 在Recovery中刷入ZIP包
+            4. 重启设备
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         if: success()
+
+      - name: 清理工作区
+        if: always()
+        run: |
+          echo "开始工作区清理..."
+          
+          # 记录清理前的磁盘使用情况
+          echo "清理前磁盘使用情况："
+          df -h
+          
+          # 清理内核编译目录
+          if [ -d "${{ env.WORKSPACE }}" ]; then
+            echo "移除内核工作目录: ${{ env.WORKSPACE }}"
+            rm -rf ${{ env.WORKSPACE }} || echo "警告：无法移除工作目录"
+          fi
+          
+          # 清理发布文件及其哈希
+          if [ -n "${{ env.ZIP_NAME }}" ]; then
+            echo "移除发布文件: ${{ env.ZIP_NAME }}*"
+            rm -f ${{ env.ZIP_NAME }}* || echo "警告：无法移除发布文件"
+          fi
+          
+          # 清理系统临时文件
+          echo "清理系统临时文件..."
+          sudo rm -rf /tmp/* /var/tmp/* || echo "警告：清理临时文件时出错"
+          
+          # 清理APT缓存
+          echo "清理APT缓存..."
+          sudo apt clean || echo "警告：清理APT缓存时出错"
+          
+          # 记录清理后的磁盘使用情况
+          echo "清理后磁盘使用情况："
+          df -h
+          
+          echo "工作区清理完成"
+
+      - name: 构建总结
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "🎉 内核构建成功！"
+            echo "发布标签: suki-kernel-${{ github.event.inputs.DEVICE_CODENAME }}-${{ env.TIMESTAMP }}"
+          else
+            echo "❌ 内核构建失败，请查看日志排查问题"
+          fi
