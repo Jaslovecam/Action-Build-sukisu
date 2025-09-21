@@ -223,7 +223,7 @@ jobs:
       - name: Initialize Repo and Sync
         run: |
           mkdir kernel_workspace && cd kernel_workspace
-          repo init -u https://github.com/yaap/kernel_oneplus_sm8650.git -b sixteen kernel_platform
+          repo init -u repo init -u https://github.com/Jaslovecam/kernel_oneplus_sm8650.git -b main kernel_platform
           repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync
 
           for dir in kernel_platform/common kernel_platform/msm-kernel; do
