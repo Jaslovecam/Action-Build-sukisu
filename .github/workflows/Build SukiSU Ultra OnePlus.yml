@@ -5,7 +5,7 @@ on:
       FILE:
         type: choice
         description: "配置文件"
-        required: true
+        required: false
         default: oneplus12_v
         options:
           - oneplus_nord_ce4_lite_5g_v
@@ -139,7 +139,7 @@ jobs:
       - name: Check Disk Space
         run: df -h
 
-      - name: Create and Enable 3G Swap
+      - name: Create and Enable 4G Swap
         run: |
           sudo swapoff -a
           sudo fallocate -l 4G /swapfile
@@ -223,9 +223,6 @@ jobs:
       - name: Initialize Repo and Sync
         run: |
           mkdir kernel_workspace && cd kernel_workspace
-          mkdir -p .repo/manifests
-          FILE="${{ github.event.inputs.FILE }}"
-          cp "$GITHUB_WORKSPACE/.repo/manifests_fallback/${FILE}.xml" ".repo/manifests/${FILE}.xml"
           repo init -u https://github.com/yaap/kernel_oneplus_sm8650.git -b sixteen kernel_platform
           repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync
 
